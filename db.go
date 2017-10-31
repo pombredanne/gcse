@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golangplus/strings"
+
 	"github.com/daviddengcn/go-index"
 	"github.com/daviddengcn/go-villa"
 )
@@ -208,6 +210,15 @@ func (mdb *MemDB) Iterate(output func(key string, val interface{}) error) error 
 	return nil
 }
 
+// Count returns the number of entries in the DB
+func (mdb *MemDB) Count() int {
+	mdb.RLock()
+	defer mdb.RUnlock()
+
+	return len(mdb.db)
+}
+
+// TokenIndexer is thread-safe.
 type TokenIndexer struct {
 	index.TokenIndexer
 	fn villa.Path
@@ -304,11 +315,11 @@ func (ti *TokenIndexer) Export(root villa.Path, kind string) error {
 	return ti.TokenIndexer.Save(f)
 }
 
-func (ti *TokenIndexer) Put(id string, tokens villa.StrSet) {
+func (ti *TokenIndexer) Put(id string, tokens stringsp.Set) {
 	ti.Lock()
 	defer ti.Unlock()
 
-	ti.TokenIndexer.Put(id, tokens)
+	ti.TokenIndexer.PutTokens(id, tokens)
 	ti.lastModified = time.Now()
 	ti.modified = true
 }

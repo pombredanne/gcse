@@ -2,16 +2,31 @@
     web: {
         // addr: ":8080"
         // root: "./server/"
+	// loadtemplatepass: ""
+	// autoloadtemplate: false
     }
-    
+
     back: {
         // dbroot: "./data/"
-        // update_cycle: "1h"
     }
-    
+
     crawler: {
-        // syncgap: "10m"
+        // due_per_run: "1h"
         // godoc: true
         // github_update: true
+		// noncrawl_hosts: []
+		// github: {
+		// 	clientid: ""
+		// 	clientsecret: ""
+		// }
     }
-} 
+
+	docdb: {
+		// nonstore_regexps: []
+	}
+
+	bi: {
+		// data_path: "/tmp/gcse.bolt"
+		// web_path: "/bi"
+	}
+}

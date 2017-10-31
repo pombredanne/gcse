@@ -1,164 +1,226 @@
 package main
 
 import (
-	"fmt"
+	"errors"
+	"log"
+	"os"
+	"runtime"
+	"sync/atomic"
+	"time"
+
+	"github.com/golangplus/strings"
+
+	"github.com/daviddengcn/bolthelper"
 	"github.com/daviddengcn/gcse"
+	"github.com/daviddengcn/gcse/configs"
+	"github.com/daviddengcn/gcse/store"
+	"github.com/daviddengcn/gcse/utils"
+	"github.com/daviddengcn/go-easybi"
 	"github.com/daviddengcn/go-index"
-	"github.com/daviddengcn/go-villa"
-	"strings"
+
+	sppb "github.com/daviddengcn/gcse/proto/spider"
 )
 
-type StatItem struct {
-	Name    string
-	Package string
-	Link    string // no package, specify a link
-	Info    string
-}
-type StatList struct {
-	Name  string
-	Info  string
-	Items []StatItem
+var (
+	databaseValue atomic.Value
+	indexSegment  utils.Segment
+)
+
+type database interface {
+	PackageCount() int
+	ProjectCount() int
+	IndexUpdated() time.Time
+	Close()
+
+	FindFullPackage(id string) (hit gcse.HitInfo, found bool)
+	ForEachFullPackage(func(gcse.HitInfo) error) error
+	PackageCountOfToken(field, token string) int
+	Search(q map[string]stringsp.Set, out func(docID int32, data interface{}) error) error
+	PackageCrawlHistory(pkg string) *sppb.HistoryInfo
 }
 
-type TopN struct {
-	cmp villa.CmpFunc
-	pq  *villa.PriorityQueue
-	n   int
+type searcherDB struct {
+	ts   index.TokenSetSearcher
+	hits *index.ConstArrayReader
+
+	projectCount int
+	indexUpdated time.Time
+
+	storeDB *bh.RefCountBox
 }
 
-func NewTopN(cmp villa.CmpFunc, n int) *TopN {
-	return &TopN{
-		cmp: cmp,
-		pq:  villa.NewPriorityQueue(cmp),
-		n:   n,
+func (db *searcherDB) PackageCount() int {
+	if db == nil {
+		return 0
 	}
+	return db.ts.DocCount()
 }
 
-func (t *TopN) Append(item interface{}) {
-	if t.pq.Len() < t.n {
-		t.pq.Push(item)
-	} else if t.cmp(t.pq.Peek(), item) < 0 {
-		t.pq.Pop()
-		t.pq.Push(item)
+func (db *searcherDB) ProjectCount() int {
+	if db == nil {
+		return 0
 	}
+	return db.projectCount
 }
 
-func (t *TopN) PopAll() []interface{} {
-	lst := make([]interface{}, t.pq.Len())
-	for i := range lst {
-		lst[len(lst)-i-1] = t.pq.Pop()
+func (db *searcherDB) IndexUpdated() time.Time {
+	if db == nil {
+		return time.Now()
 	}
-
-	return lst
+	return db.indexUpdated
 }
 
-func (t *TopN) Len() int {
-	return t.pq.Len()
+func (db *searcherDB) Close() {
+	if db == nil {
+		return
+	}
+	db.hits.Close()
 }
 
-func inProjects(projs villa.StrSet, pkg string) bool {
-	for {
-		if projs.In(pkg) {
-			return true
+var notFoundInHits = errors.New("Not found in hits")
+
+func (db *searcherDB) FindFullPackage(id string) (gcse.HitInfo, bool) {
+	if db == nil {
+		log.Print("Database not loaded!")
+		return gcse.HitInfo{}, false
+	}
+	var hit gcse.HitInfo
+	found := false
+	if err := db.ts.Search(index.SingleFieldQuery(gcse.IndexPkgField, id), func(docID int32, _ interface{}) error {
+		h, err := db.hits.GetGob(int(docID))
+		if err != nil {
+			return err
 		}
-		p := strings.LastIndex(pkg, "/")
-		if p < 0 {
-			break
-		}
-		pkg = pkg[:p]
+		hit = h.(gcse.HitInfo)
+		found = true
+		return nil
+	}); err != nil {
+		return gcse.HitInfo{}, false
 	}
-	
-	return false
+	if !found {
+		return gcse.HitInfo{}, false
+	}
+	return hit, true
 }
 
-func statTops(N int) []StatList {
-	indexDB := indexDBBox.Get().(*index.TokenSetSearcher)
-	if indexDB == nil {
+func (db *searcherDB) ForEachFullPackage(out func(gcse.HitInfo) error) error {
+	if db == nil {
 		return nil
 	}
+	return db.hits.ForEachGob(func(_ int, hit interface{}) error {
+		return out(hit.(gcse.HitInfo))
+	})
+}
 
-	var topStaticScores []gcse.HitInfo
-	var tssProjects villa.StrSet
+func (db *searcherDB) PackageCountOfToken(field, token string) int {
+	if db == nil {
+		return 0
+	}
+	return len(db.ts.TokenDocList(field, token))
+}
 
+func (db *searcherDB) Search(q map[string]stringsp.Set, out func(docID int32, data interface{}) error) error {
+	if db == nil {
+		return nil
+	}
+	return db.ts.Search(q, out)
+}
 
-	topImported := NewTopN(func(a, b interface{}) int {
-		return villa.IntValueCompare(len(a.(gcse.HitInfo).Imported),
-			len(b.(gcse.HitInfo).Imported))
-	}, N)
+func (db *searcherDB) PackageCrawlHistory(pkg string) *sppb.HistoryInfo {
+	site, path := utils.SplitPackage(pkg)
+	info, err := store.ReadPackageHistoryOf(db.storeDB, site, path)
+	if err != nil {
+		log.Printf("ReadPackageHistoryOf %s %s failed: %v", site, path, err)
+		return nil
+	}
+	return info
+}
 
-	sites := make(map[string]int)
-		
-	indexDB.Search(nil, func(docID int32, data interface{}) error {
+func getDatabase() database {
+	db, ok := databaseValue.Load().(database)
+	if !ok {
+		return (*searcherDB)(nil)
+	}
+	return db
+}
+
+func loadIndex() error {
+	segm, err := configs.IndexSegments().FindMaxDone()
+	if segm == "" || err != nil {
+		return err
+	}
+	if indexSegment != "" && !utils.SegmentLess(indexSegment, segm) {
+		// no new index
+		return nil
+	}
+	db := &searcherDB{}
+	if err := func() error {
+		f, err := os.Open(segm.Join(gcse.IndexFn))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		return db.ts.Load(f)
+	}(); err != nil {
+		return err
+	}
+	db.storeDB = &bh.RefCountBox{
+		DataPath: func() string {
+			return segm.Join(configs.FnStore)
+		},
+	}
+	hitsPath := segm.Join(gcse.HitsArrFn)
+	if db.hits, err = index.OpenConstArray(hitsPath); err != nil {
+		log.Printf("OpenConstArray %v failed: %v", hitsPath, err)
+		return err
+	}
+	// Calculate db.projectCount
+	var projects stringsp.Set
+	db.ts.Search(nil, func(docID int32, data interface{}) error {
 		hit := data.(gcse.HitInfo)
-		hit.Name = packageShowName(hit.Name, hit.Package)
-
-		// assuming all packages has been sorted by static-scores.
-		if len(topStaticScores) < N {
-			if !inProjects(tssProjects, hit.Package) {
-				topStaticScores = append(topStaticScores, hit)
-				tssProjects.Put(hit.Package)
-			}
-		}
-		
-		topImported.Append(hit)
-
-		host := strings.ToLower(gcse.HostOfPackage(hit.Package))
-		if host != "" {
-			sites[host] = sites[host] + 1
-		}
-
+		projects.Add(hit.ProjectURL)
 		return nil
 	})
+	db.projectCount = len(projects)
+	gcse.AddBiValueAndProcess(bi.Max, "index.proj-count", db.projectCount)
 
-	tlStaticScore := StatList{
-		Name:  "Hot",
-		Info:  "refs stars",
-		Items: make([]StatItem, 0, len(topStaticScores)),
+	// Update db.indexUpdated
+	db.indexUpdated = time.Now()
+	if st, err := os.Stat(segm.Join(gcse.IndexFn)); err == nil {
+		db.indexUpdated = st.ModTime()
 	}
-	for _, hit := range topStaticScores {
-		tlStaticScore.Items = append(tlStaticScore.Items, StatItem{
-			Name:    hit.Name,
-			Package: hit.Package,
-			Info:    fmt.Sprintf("%d %d", len(hit.Imported), hit.StarCount),
-		})
-	}
+	indexSegment = segm
+	log.Printf("Load index from %v (%d packages)", segm, db.PackageCount())
 
-	tlImported := StatList{
-		Name:  "Most Imported",
-		Info:  "refs",
-		Items: make([]StatItem, 0, topImported.Len()),
-	}
-	for _, item := range topImported.PopAll() {
-		hit := item.(gcse.HitInfo)
-		tlImported.Items = append(tlImported.Items, StatItem{
-			Name:    hit.Name,
-			Package: hit.Package,
-			Info:    fmt.Sprintf("%d", len(hit.Imported)),
-		})
-	}
+	// Exchange new/old database and close the old one.
+	oldDB := getDatabase()
+	databaseValue.Store(db)
+	oldDB.Close()
+	oldDB = nil
+	utils.DumpMemStats()
 
-	topSites := NewTopN(func(a, b interface{}) int {
-		return villa.IntValueCompare(sites[a.(string)], sites[b.(string)])
-	}, N)
-	for site := range sites {
-		topSites.Append(site)
-	}
-	tlSites := StatList{
-		Name:  "Sites",
-		Info:  "packages",
-		Items: make([]StatItem, 0, topSites.Len()),
-	}
-	for _, st := range topSites.PopAll() {
-		site := st.(string)
-		cnt := sites[site]
-		tlSites.Items = append(tlSites.Items, StatItem{
-			Name: site,
-			Link: "http://" + site,
-			Info: fmt.Sprintf("%d", cnt),
-		})
-	}
+	runtime.GC()
+	utils.DumpMemStats()
 
-	return []StatList{
-		tlStaticScore, tlImported, tlSites,
+	return nil
+}
+
+func loadIndexLoop() {
+	for {
+		time.Sleep(30 * time.Second)
+
+		if err := loadIndex(); err != nil {
+			log.Printf("loadIndex failed: %v", err)
+		}
+		bi.AddValue(bi.Max, "search.age_in_hours", int(time.Now().Sub(getDatabase().IndexUpdated()).Hours()))
+		bi.AddValue(bi.Max, "search.age_in_mins", int(time.Now().Sub(getDatabase().IndexUpdated()).Minutes()))
+	}
+}
+
+func processBi() {
+	for {
+		bi.Process()
+		time.Sleep(time.Minute)
 	}
 }
